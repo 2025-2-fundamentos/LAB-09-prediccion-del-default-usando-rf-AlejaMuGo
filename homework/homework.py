@@ -92,3 +92,155 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import pandas as pd
+import gzip
+import pickle
+import json
+import zipfile
+from glob import glob
+from pathlib import Path
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+
+# Leer los archivos comprimidos y cargarlos en DataFrames
+def load_zip_data(directory: str) -> list[pd.DataFrame]:
+    data_frames = []
+    for zip_file in sorted(glob(os.path.join(directory, "*.zip"))):
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            for file_name in zf.namelist():
+                with zf.open(file_name) as file:
+                    df = pd.read_csv(file, sep=",", index_col=0)
+                    data_frames.append(df)
+    return data_frames
+
+
+# Preprocesamiento y limpieza de los datos
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={"default payment next month": "default"})
+    df.dropna(inplace=True)
+    if "ID" in df.columns:
+        df.drop(columns=["ID"], inplace=True)
+    
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda v: 4 if v > 4 else v)
+    df["EDUCATION"] = df["EDUCATION"].astype(str)
+    
+    return df
+
+
+# Función principal que entrena el modelo y guarda los resultados
+def execute_model_training():
+    data_frames = load_zip_data("files/input")
+    train_df, test_df = data_frames  # Suponemos que hay dos archivos de entrada
+
+    # Limpiar los datos
+    train_df = preprocess_data(train_df)
+    test_df = preprocess_data(test_df)
+
+    # Separar variables predictoras y variable objetivo
+    X_train = train_df.drop(columns=["default"])
+    y_train = train_df["default"]
+    X_test = test_df.drop(columns=["default"])
+    y_test = test_df["default"]
+    
+    # Crear el pipeline con OneHotEncoder y RandomForestClassifier
+    categorical_columns = ["SEX", "EDUCATION", "MARRIAGE"]
+    onehot_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    
+    preprocessor = ColumnTransformer(
+        transformers=[('categorical', onehot_encoder, categorical_columns)],
+        remainder="passthrough"
+    )
+    
+    rf_classifier = RandomForestClassifier(random_state=42)
+    pipeline = Pipeline(steps=[('preprocessing', preprocessor), ('classifier', rf_classifier)])
+    
+    # Definir el espacio de hiperparámetros a optimizar
+    param_grid = {
+        'classifier__n_estimators': [100, 200, 500],
+        'classifier__max_depth': [None, 5, 10],
+        'classifier__min_samples_split': [2, 5],
+        'classifier__min_samples_leaf': [1, 2]
+    }
+    
+    grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, cv=10, scoring='balanced_accuracy', n_jobs=-1, refit=True, verbose=2)
+    grid_search.fit(X_train, y_train)
+
+    # Guardar el modelo entrenado
+    model_output_path = 'files/models/model.pkl.gz'
+    os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+    with gzip.open(model_output_path, 'wb') as f:
+        pickle.dump(grid_search, f)
+
+    # Generar predicciones
+    y_train_pred = grid_search.predict(X_train)
+    y_test_pred = grid_search.predict(X_test)
+
+    # Calcular métricas para el conjunto de entrenamiento y prueba
+    train_metrics = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": precision_score(y_train, y_train_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
+        "recall": recall_score(y_train, y_train_pred, zero_division=0),
+        "f1_score": f1_score(y_train, y_train_pred, zero_division=0),
+    }
+
+    test_metrics = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": precision_score(y_test, y_test_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
+        "recall": recall_score(y_test, y_test_pred, zero_division=0),
+        "f1_score": f1_score(y_test, y_test_pred, zero_division=0),
+    }
+
+    # Calcular las matrices de confusión
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+
+    # Crear un diccionario para las matrices de confusión
+    cm_train_dict = {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {"predicted_0": cm_train[0, 0], "predicted_1": cm_train[0, 1]},
+        "true_1": {"predicted_0": cm_train[1, 0], "predicted_1": cm_train[1, 1]},
+    }
+
+    cm_test_dict = {
+        "type": "cm_matrix",
+        "dataset": "test",
+        "true_0": {"predicted_0": cm_test[0, 0], "predicted_1": cm_test[0, 1]},
+        "true_1": {"predicted_0": cm_test[1, 0], "predicted_1": cm_test[1, 1]},
+    }
+
+    # Guardar las métricas y matrices de confusión en un único archivo JSON
+    output_dir = 'files/output'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(os.path.join(output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
+        json.dump(train_metrics, f, ensure_ascii=False)
+        f.write("\n")  # Línea nueva entre registros
+        json.dump(test_metrics, f, ensure_ascii=False)
+        f.write("\n")
+        json.dump(cm_train_dict, f, ensure_ascii=False)
+        f.write("\n")
+        json.dump(cm_test_dict, f, ensure_ascii=False)
+
+    print("Proceso completado y archivos guardados.")
+
+
+# Ejecutar la función
+if __name__ == "__main__":
+    execute_model_training()
